@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "rum": {
+      "command": "node",
+      "args": ["/path/to/rum/dist/index.js", "my-project-name"],
+      "env": {
+        "RUM_EMBEDDING_PROVIDER": "ollama",
+        "RUM_EMBEDDING_MODEL": "bge-m3",
+        "RUM_EMBEDDING_URL": "http://localhost:11434"
+      }
+    }
+  }
+}

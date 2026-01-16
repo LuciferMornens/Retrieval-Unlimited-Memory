@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rum": {
+      "command": "node",
+      "args": ["/path/to/rum/dist/index.js", "my-project-name"],
+      "env": {
+        "RUM_EMBEDDING_PROVIDER": "openai",
+        "OPENAI_API_KEY": "sk-your-key-here"
+      }
+    }
+  }
+}
