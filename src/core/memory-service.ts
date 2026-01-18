@@ -556,7 +556,7 @@ export class MemoryService {
   link(params: RumLinkParams): RumLinkResult {
     const linkId = `link_${uuidv4()}`;
 
-    this.db.createLink({
+    const { created } = this.db.createLink({
       id: linkId,
       sourceId: params.source_id,
       targetId: params.target_id,
@@ -564,7 +564,7 @@ export class MemoryService {
     });
 
     return {
-      created: true,
+      created,
       link_id: linkId,
     };
   }

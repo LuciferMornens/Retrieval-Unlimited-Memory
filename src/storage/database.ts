@@ -3,6 +3,8 @@ import { mkdirSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { homedir } from "os";
 
+const escapeLikePattern = (value: string): string => value.replace(/[\\%_]/g, "\\$&");
+
 const SCHEMA = `
 -- Agent identities
 CREATE TABLE IF NOT EXISTS agents (
@@ -532,9 +534,9 @@ export class RumDatabase {
       query = `
         SELECT DISTINCT m.* FROM memories m
         JOIN memory_files mf ON m.id = mf.memory_id
-        WHERE ${conditions.join(" AND ")} AND mf.file_path LIKE ?
+        WHERE ${conditions.join(" AND ")} AND mf.file_path LIKE ? ESCAPE '\\'
       `;
-      values.push(`%${params.file}%`);
+      values.push(`%${escapeLikePattern(params.file)}%`);
     }
 
     // Sort
@@ -596,11 +598,15 @@ export class RumDatabase {
     const stmt = this.db.prepare(`
       SELECT DISTINCT m.* FROM memories m
       JOIN memory_files mf ON m.id = mf.memory_id
-      WHERE mf.file_path LIKE ? AND m.project_id = ?
+      WHERE mf.file_path LIKE ? ESCAPE '\\' AND m.project_id = ?
       ORDER BY m.created_at DESC
       LIMIT ?
     `);
-    return stmt.all(`%${filePath}%`, this.projectId, limit) as Record<string, unknown>[];
+    return stmt.all(
+      `%${escapeLikePattern(filePath)}%`,
+      this.projectId,
+      limit
+    ) as Record<string, unknown>[];
   }
 
   // ============================================================================
@@ -612,12 +618,19 @@ export class RumDatabase {
     sourceId: string;
     targetId: string;
     linkType: string;
-  }): void {
+  }): { created: boolean } {
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO memory_links (id, source_id, target_id, link_type, created_at)
       VALUES (?, ?, ?, ?, ?)
     `);
-    stmt.run(params.id, params.sourceId, params.targetId, params.linkType, Date.now());
+    const result = stmt.run(
+      params.id,
+      params.sourceId,
+      params.targetId,
+      params.linkType,
+      Date.now()
+    );
+    return { created: result.changes > 0 };
   }
 
   getLinksFrom(memoryId: string): Array<{ target_id: string; link_type: string }> {

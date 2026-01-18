@@ -20,6 +20,7 @@ import {
   RumTraceParamsSchema,
   RumListParamsSchema,
   RumLinkParamsSchema,
+  RumCheckFileParamsSchema,
   RumUpdateMemoryParamsSchema,
   RumIdentityParamsSchema,
   RumCreateChapterParamsSchema,
@@ -43,6 +44,44 @@ const embeddingConfig = {
   baseUrl: process.env.RUM_EMBEDDING_URL,
   apiKey: process.env.OPENAI_API_KEY,
 };
+const embeddingTimeoutMs = Number(process.env.RUM_EMBEDDING_TIMEOUT_MS) || 20000;
+const shutdownTimeoutMs = Number(process.env.RUM_SHUTDOWN_TIMEOUT_MS) || 5000;
+
+const withTimeout = async <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> => {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+  let timeoutId: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
+const runWithEmbeddingTimeout = async <T>(
+  operation: () => Promise<T>,
+  shouldApply: boolean
+): Promise<T> => {
+  const promise = operation();
+  if (!shouldApply) {
+    return promise;
+  }
+  return withTimeout(
+    promise,
+    embeddingTimeoutMs,
+    `Embedding request timed out after ${embeddingTimeoutMs}ms`
+  );
+};
 
 // Initialize services
 const db = new RumDatabase({ projectId });
@@ -54,6 +93,27 @@ const synthesisService = new SynthesisService(db);
 
 // Log embedding status
 console.error(`RUM: Embeddings ${memoryService.embeddingsEnabled ? "enabled" : "disabled"} (${embeddingProvider})`);
+
+const pendingOperations = new Set<Promise<unknown>>();
+let isShuttingDown = false;
+let shutdownPromise: Promise<void> | null = null;
+
+const trackOperation = <T>(promise: Promise<T>): Promise<T> => {
+  pendingOperations.add(promise);
+  promise.finally(() => pendingOperations.delete(promise));
+  return promise;
+};
+
+const drainPendingOperations = async (): Promise<void> => {
+  if (pendingOperations.size === 0) {
+    return;
+  }
+  await withTimeout(
+    Promise.allSettled(Array.from(pendingOperations)),
+    shutdownTimeoutMs,
+    `Timed out waiting for ${pendingOperations.size} pending operation(s)`
+  );
+};
 
 // Create MCP server
 const server = new Server(
@@ -630,10 +690,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (isShuttingDown) {
+    return {
+      content: [{ type: "text", text: "Server is shutting down. Try again later." }],
+      isError: true,
+    };
+  }
+
   const { name, arguments: args } = request.params;
 
-  try {
-    switch (name) {
+  const operation = (async () => {
+    try {
+      switch (name) {
       case "identity": {
         const params = RumIdentityParamsSchema.parse(args);
         const result = identityService.handleIdentity(params);
@@ -653,7 +721,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "store": {
         const params = RumStoreParamsSchema.parse(args);
-        const result = await memoryService.store(params);
+        const result = await runWithEmbeddingTimeout(
+          () => memoryService.store(params),
+          memoryService.embeddingsEnabled
+        );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -661,7 +732,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "update_memory": {
         const params = RumUpdateMemoryParamsSchema.parse(args);
-        const result = await memoryService.updateMemory(params);
+        const needsEmbedding =
+          memoryService.embeddingsEnabled &&
+          !!(params.intent || params.outcome || params.reasoning);
+        const result = await runWithEmbeddingTimeout(
+          () => memoryService.updateMemory(params),
+          needsEmbedding
+        );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -669,7 +746,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "recall": {
         const params = RumRecallParamsSchema.parse(args);
-        const result = await memoryService.recall(params);
+        const needsEmbedding = memoryService.embeddingsEnabled && !!params.query;
+        const result = await runWithEmbeddingTimeout(
+          () => memoryService.recall(params),
+          needsEmbedding
+        );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -700,7 +781,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "check_file": {
-        const filePath = (args as { file_path: string }).file_path;
+        const params = RumCheckFileParamsSchema.parse(args);
+        const filePath = params.file_path;
         const notification = triggerService.checkFileTouch(filePath);
 
         if (notification) {
@@ -792,13 +874,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text", text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  })();
+
+  return trackOperation(operation);
 });
 
 // ============================================================================
@@ -817,12 +902,40 @@ main().catch((error) => {
 });
 
 // Cleanup on exit
+const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+  isShuttingDown = true;
+  shutdownPromise = (async () => {
+    console.error(`RUM server shutting down (${signal})...`);
+    try {
+      await drainPendingOperations();
+    } catch (error) {
+      console.error("RUM shutdown wait failed:", error);
+      process.exitCode = 1;
+    }
+    try {
+      await server.close();
+    } catch (error) {
+      console.error("RUM server close failed:", error);
+      process.exitCode = 1;
+    } finally {
+      db.close();
+    }
+  })();
+
+  try {
+    await shutdownPromise;
+  } finally {
+    process.exit(process.exitCode ?? 0);
+  }
+};
+
 process.on("SIGINT", () => {
-  db.close();
-  process.exit(0);
+  void shutdown("SIGINT");
 });
 
 process.on("SIGTERM", () => {
-  db.close();
-  process.exit(0);
+  void shutdown("SIGTERM");
 });

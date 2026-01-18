@@ -320,6 +320,11 @@ export const RumLinkParamsSchema = z.object({
 });
 export type RumLinkParams = z.infer<typeof RumLinkParamsSchema>;
 
+export const RumCheckFileParamsSchema = z.object({
+  file_path: z.string(),
+});
+export type RumCheckFileParams = z.infer<typeof RumCheckFileParamsSchema>;
+
 export const RumIdentityParamsSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("register"),
